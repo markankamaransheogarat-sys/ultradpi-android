@@ -30,25 +30,62 @@ class UltraDpiVpnService : VpnService() {
         const val ACTION_START = "com.ultradpi.START"
         const val ACTION_STOP = "com.ultradpi.STOP"
         const val EXTRA_PRESET = "com.ultradpi.PRESET_INDEX"
-        const val CHANNEL_ID = "ultradpi_channel_v8"
-        const val NOTIFICATION_ID = 1008
+        const val EXTRA_ENABLE_IPV6 = "com.ultradpi.ENABLE_IPV6"
+        const val EXTRA_CUSTOM_ARGS = "com.ultradpi.CUSTOM_ARGS"
+        const val CHANNEL_ID = "ultradpi_channel_v9"
+        const val NOTIFICATION_ID = 1009
         const val SOCKS_PORT = 10808
+
+        fun shellSplit(string: CharSequence): Array<String> {
+            val tokens = mutableListOf<String>()
+            var escaping = false
+            var quoteChar = ' '
+            var quoting = false
+            var current = StringBuilder()
+
+            for (c in string) {
+                if (escaping) {
+                    current.append(c)
+                    escaping = false
+                } else if (c == '\\') {
+                    escaping = true
+                } else if (quoting && c == quoteChar) {
+                    quoting = false
+                } else if (!quoting && (c == '\'' || c == '"')) {
+                    quoting = true
+                    quoteChar = c
+                } else if (!quoting && Character.isWhitespace(c)) {
+                    if (current.isNotEmpty()) {
+                        tokens.add(current.toString())
+                        current = StringBuilder()
+                    }
+                } else {
+                    current.append(c)
+                }
+            }
+            if (current.isNotEmpty()) {
+                tokens.add(current.toString())
+            }
+            return tokens.toTypedArray()
+        }
     }
 
-    private var currentPreset = BypassPreset.UNIVERSAL
+    private var currentPreset = BypassPreset.MOBILE_4G
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
                 val presetIndex = intent.getIntExtra(EXTRA_PRESET, 0)
-                startEngine(presetIndex)
+                val enableIpv6 = intent.getBooleanExtra(EXTRA_ENABLE_IPV6, true)
+                val customArgs = intent.getStringExtra(EXTRA_CUSTOM_ARGS) ?: ""
+                startEngine(presetIndex, enableIpv6, customArgs)
             }
             ACTION_STOP -> stopEngine()
         }
         return START_NOT_STICKY
     }
 
-    private fun startEngine(presetIndex: Int) {
+    private fun startEngine(presetIndex: Int, enableIpv6: Boolean, customArgs: String) {
         if (isRunning) return
         isRunning = true
         currentPreset = BypassPreset.fromIndex(presetIndex)
@@ -67,12 +104,18 @@ class UltraDpiVpnService : VpnService() {
                 startForeground(NOTIFICATION_ID, notification)
             }
 
-            Log.i(TAG, "Starting ByeDPI proxy with preset: ${currentPreset.title}")
+            val effectiveArgs = if (currentPreset == BypassPreset.CUSTOM && customArgs.isNotBlank()) {
+                shellSplit(customArgs.trim())
+            } else {
+                currentPreset.args
+            }
+
+            Log.i(TAG, "Starting ByeDPI proxy with preset: ${currentPreset.title}, args: ${effectiveArgs.joinToString(" ")}")
 
             // 1. Запуск нативного ByeDPI Proxy
             proxyThread = Thread {
                 try {
-                    val code = byeDpiProxy.startProxyWithPreset(SOCKS_PORT, currentPreset.args)
+                    val code = byeDpiProxy.startProxyWithPreset(SOCKS_PORT, effectiveArgs)
                     Log.i(TAG, "ByeDPI proxy exited with code $code")
                 } catch (e: Throwable) {
                     Log.e(TAG, "Error in ByeDPI thread", e)
@@ -118,7 +161,16 @@ class UltraDpiVpnService : VpnService() {
                 )
                 .addAddress("10.10.10.10", 32)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer("77.88.8.8")
+
+            if (enableIpv6) {
+                // Маршрутизация всего IPv6 в туннель полностью исключает утечки на сотовых сетях (МТС, Билайн, Мегафон, Tele2)
+                builder.addAddress("fd00::1", 128)
+                    .addRoute("::", 0)
+                builder.addDnsServer("2a02:6b8::feed:0ff") // Yandex IPv6
+                builder.addDnsServer("2606:4700:4700::1111") // Cloudflare IPv6
+            }
+
+            builder.addDnsServer("77.88.8.8")
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
                 .addDisallowedApplication(applicationContext.packageName)
@@ -136,8 +188,6 @@ class UltraDpiVpnService : VpnService() {
             this.vpnInterface = pfd
 
             // 4. Валидная конфигурация tun2socks (hev-socks5-tunnel)
-            // Внимание: секция 'tunnel:' в этой версии libhev-socks5-tunnel приводит к ошибке 'Parse failed'.
-            // Конфиг должен строго содержать только 'misc' и 'socks5':
             val tun2socksConfig = """
                 misc:
                   task-stack-size: 81920
@@ -160,10 +210,9 @@ class UltraDpiVpnService : VpnService() {
             this.configFile = tempFile
 
             // 5. Запуск туннелирования tun2socks
-            // TProxyStartService внутри нативно создает свой рабочий поток
             TProxyService.TProxyStartService(tempFile.absolutePath, pfd.fd)
 
-            Log.i(TAG, "UltraDPI connected and routing all traffic!")
+            Log.i(TAG, "UltraDPI connected successfully! IPv6 routing=$enableIpv6")
         } catch (e: Throwable) {
             Log.e(TAG, "Fatal starting UltraDPI", e)
             stopEngine()
