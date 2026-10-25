@@ -26,8 +26,8 @@ class UltraDpiVpnService : VpnService() {
         const val TAG = "UltraDpiVpn"
         const val ACTION_START = "com.ultradpi.START"
         const val ACTION_STOP = "com.ultradpi.STOP"
-        const val CHANNEL_ID = "ultradpi_channel_v5"
-        const val NOTIFICATION_ID = 1005
+        const val CHANNEL_ID = "ultradpi_channel_v6"
+        const val NOTIFICATION_ID = 1006
         const val SOCKS_PORT = 10808
     }
 
@@ -57,17 +57,19 @@ class UltraDpiVpnService : VpnService() {
                 startForeground(NOTIFICATION_ID, notification)
             }
 
-            // 1. Запуск нативного ByeDPI демона (без UDP -u, чисто TCP desync, сплит на 1-м байте с фейк пакетом)
+            // 1. Стандартный проверенный пресет ByeDPI:
+            // -s 1 (TCP split pos 1)
+            // -q 1 (DISOOB / disorder)
+            // -e 1 (split TLS ClientHello SNI)
+            // БЕЗ фейковых пакетов (-f/--fake), так как битые фейк-пакеты вызывают ERR_SSL_VERSION_OR_CIPHER_MISMATCH в Chrome/YouTube
             val args = arrayOf(
                 "ciadpi",
                 "-i", "127.0.0.1",
                 "-p", "$SOCKS_PORT",
                 "-s", "1",
                 "-q", "1",
-                "-e", "2",
-                "-o", "1+s",
-                "--fake", "-1",
-                "--ttl", "3"
+                "-e", "1",
+                "-o", "1"
             )
 
             proxyThread = Thread {
@@ -82,17 +84,16 @@ class UltraDpiVpnService : VpnService() {
                 start()
             }
 
-            // Пауза, чтобы демон успел открыть порт 127.0.0.1:10808
-            Thread.sleep(250)
+            Thread.sleep(200)
 
-            // 2. Создание VPN интерфейса с обязательным исключением самого себя (иначе петля трафика)
+            // 2. Создание VPN-туннеля
             val builder = Builder()
                 .setSession("UltraDPI Engine")
                 .addAddress("10.10.10.10", 32)
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
-                .addDisallowedApplication(applicationContext.packageName) // КРИТИЧЕСКИ ВАЖНО: предотвращает routing loop
+                .addDisallowedApplication(applicationContext.packageName)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
@@ -100,13 +101,13 @@ class UltraDpiVpnService : VpnService() {
 
             val pfd = builder.establish()
             if (pfd == null) {
-                Log.e(TAG, "VPN establish returned null")
+                Log.e(TAG, "VPN builder returned null")
                 stopEngine()
                 return
             }
             this.vpnInterface = pfd
 
-            // 3. Конфигурация hev-socks5-tunnel
+            // 3. Конфиг hev-socks5-tunnel
             val tun2socksConfig = """
                 misc:
                   task-stack-size: 81920
@@ -120,7 +121,7 @@ class UltraDpiVpnService : VpnService() {
             val configFile = File(cacheDir, "tunnel.yaml")
             configFile.writeText(tun2socksConfig)
 
-            // 4. Запуск перенаправителя пакетов hev-socks5-tunnel прямо в потоке
+            // 4. Запуск hev-socks5-tunnel
             Thread {
                 try {
                     TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)
