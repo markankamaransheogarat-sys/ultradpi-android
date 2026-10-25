@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -12,13 +13,12 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import io.github.dovecoteescapee.byedpi.core.ByeDpiProxy
 import io.github.dovecoteescapee.byedpi.core.TProxyService
-import kotlinx.coroutines.*
 import java.io.File
 
 class UltraDpiVpnService : VpnService() {
 
+    private val byeDpiProxy = ByeDpiProxy()
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var proxyFd: Int = -1
     private var proxyThread: Thread? = null
     private var tunnelThread: Thread? = null
 
@@ -26,8 +26,8 @@ class UltraDpiVpnService : VpnService() {
         const val TAG = "UltraDpiVpn"
         const val ACTION_START = "com.ultradpi.START"
         const val ACTION_STOP = "com.ultradpi.STOP"
-        const val CHANNEL_ID = "ultradpi_channel_v3"
-        const val NOTIFICATION_ID = 1002
+        const val CHANNEL_ID = "ultradpi_channel_v4"
+        const val NOTIFICATION_ID = 1003
         const val SOCKS_PORT = 10808
     }
 
@@ -42,10 +42,19 @@ class UltraDpiVpnService : VpnService() {
     private fun startEngine() {
         try {
             createNotificationChannel()
-            startForeground(NOTIFICATION_ID, buildNotification())
+            val notification = buildNotification()
 
-            // 1. Launch native ByeDPI desync daemon on port 10808
-            // Uses winning TSPU evasion args: Split SNI + Fake packets + Hop-limit TTL=3
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+
+            // 1. Запуск нативного ByeDPI прокси
             val args = arrayOf(
                 "ciadpi",
                 "-i", "127.0.0.1",
@@ -58,23 +67,24 @@ class UltraDpiVpnService : VpnService() {
                 "--ttl", "3"
             )
 
-            proxyFd = ByeDpiProxy.jniCreateSocketWithCommandLine(args)
-            if (proxyFd < 0) {
-                Log.e(TAG, "Failed to create ByeDPI native socket")
-                stopSelf()
-                return
-            }
-
             proxyThread = Thread {
-                ByeDpiProxy.jniStart(proxyFd)
+                try {
+                    val code = byeDpiProxy.startProxyWithArgs(args)
+                    Log.i(TAG, "ByeDPI stopped with code $code")
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Error in ByeDPI thread", e)
+                }
             }.apply {
-                name = "ByeDpiThread"
+                name = "ByeDpiWorker"
                 start()
             }
 
-            // 2. Establish Android VpnService interface
+            // Небольшая пауза для готовности сокета 127.0.0.1:10808
+            Thread.sleep(150)
+
+            // 2. Создание VPN сетевого интерфейса
             val builder = Builder()
-                .setSession("UltraDPI 1-Click Engine")
+                .setSession("UltraDPI Engine")
                 .addAddress("10.0.2.15", 24)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
@@ -84,12 +94,12 @@ class UltraDpiVpnService : VpnService() {
 
             vpnInterface = builder.establish()
             if (vpnInterface == null) {
-                Log.e(TAG, "VPN builder establish returned null")
+                Log.e(TAG, "VPN builder returned null")
                 stopEngine()
                 return
             }
 
-            // 3. Write hev-socks5-tunnel yaml config redirecting all system TUN traffic to 127.0.0.1:10808
+            // 3. Конфиг маршрутизации TUN -> SOCKS5
             val configFile = File(cacheDir, "tunnel.yaml")
             configFile.writeText(
                 """
@@ -103,17 +113,21 @@ class UltraDpiVpnService : VpnService() {
                 """.trimIndent()
             )
 
-            // 4. Start native hev-socks5-tunnel routing engine
+            // 4. Запуск перенаправителя пакетов hev-socks5-tunnel
             tunnelThread = Thread {
-                TProxyService.TProxyStartService(configFile.absolutePath, vpnInterface!!.fd)
+                try {
+                    TProxyService.TProxyStartService(configFile.absolutePath, vpnInterface!!.fd)
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Error in TProxy thread", e)
+                }
             }.apply {
-                name = "HevTunnelThread"
+                name = "HevTunnelWorker"
                 start()
             }
 
-            Log.i(TAG, "UltraDPI Full-Speed Local Bypass successfully started!")
+            Log.i(TAG, "UltraDPI connected successfully!")
         } catch (e: Throwable) {
-            Log.e(TAG, "Fatal starting engine", e)
+            Log.e(TAG, "Fatal starting UltraDPI", e)
             stopEngine()
         }
     }
@@ -121,13 +135,13 @@ class UltraDpiVpnService : VpnService() {
     private fun stopEngine() {
         try {
             TProxyService.TProxyStopService()
-            ByeDpiProxy.jniStop()
+            byeDpiProxy.stopProxy()
             vpnInterface?.close()
             vpnInterface = null
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         } catch (e: Throwable) {
-            Log.e(TAG, "Error stopping engine", e)
+            Log.e(TAG, "Error stopping UltraDPI", e)
         }
     }
 
@@ -162,7 +176,7 @@ class UltraDpiVpnService : VpnService() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("UltraDPI — Защита включена")
+            .setContentTitle("UltraDPI — Обход активен")
             .setContentText("YouTube 4K, Discord и нейросети работают на полной скорости")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(contentPending)

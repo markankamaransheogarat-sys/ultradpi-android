@@ -1,16 +1,34 @@
 package io.github.dovecoteescapee.byedpi.core
 
-object ByeDpiProxy {
-    init {
-        System.loadLibrary("byedpi")
+class ByeDpiProxy {
+    companion object {
+        init {
+            System.loadLibrary("byedpi")
+        }
     }
 
-    @JvmStatic
+    private var fd: Int = -1
+
+    fun startProxyWithArgs(args: Array<String>): Int {
+        val socketFd = jniCreateSocketWithCommandLine(args)
+        if (socketFd < 0) {
+            return -1
+        }
+        this.fd = socketFd
+        return jniStartProxy(socketFd)
+    }
+
+    fun stopProxy(): Int {
+        val currentFd = this.fd
+        if (currentFd >= 0) {
+            val res = jniStopProxy(currentFd)
+            this.fd = -1
+            return res
+        }
+        return 0
+    }
+
     external fun jniCreateSocketWithCommandLine(args: Array<String>): Int
-
-    @JvmStatic
-    external fun jniStart(fd: Int)
-
-    @JvmStatic
-    external fun jniStop()
+    external fun jniStartProxy(fd: Int): Int
+    external fun jniStopProxy(fd: Int): Int
 }
