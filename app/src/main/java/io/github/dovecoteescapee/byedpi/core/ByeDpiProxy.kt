@@ -18,8 +18,8 @@ class ByeDpiProxy {
         val fullArgs = arrayOf("ciadpi", "-i", "127.0.0.1", "-p", "$port") + presetArgs
         val socketFd = jniCreateSocketWithCommandLine(fullArgs)
         if (socketFd < 0) {
-            Log.e("ByeDpiProxy", "jniCreateSocketWithCommandLine failed with code $socketFd")
-            return -1
+            Log.e("ByeDpiProxy", "jniCreateSocketWithCommandLine failed with code $socketFd, falling back to clean UI socket")
+            return startProxy(port)
         }
         this.fd = socketFd
         return jniStartProxy(socketFd)
@@ -29,9 +29,9 @@ class ByeDpiProxy {
         if (fd >= 0) {
             return -1
         }
-        // Вызов проверенного JNI-метода с чистыми настройками:
-        // desyncHttp = true, desyncHttps = true, desyncUdp = false (чистый UDP для мгновенного DNS!)
-        // desyncMethod = 2 (DESYNC_DISORDER: split pos 1, reverse order - золотой стандарт обхода YouTube в РФ)
+        // Вызов проверенного JNI-метода с проверенными базовыми настройками:
+        // desyncHttp = true, desyncHttps = true, desyncUdp = true (с 1 fake UDP для QUIC)
+        // desyncMethod = 2 (DESYNC_DISORDER: split pos 1, reverse order)
         val socketFd = jniCreateSocket(
             ip = "127.0.0.1",
             port = port,
@@ -42,7 +42,7 @@ class ByeDpiProxy {
             noDomain = false,
             desyncHttp = true,
             desyncHttps = true,
-            desyncUdp = false,
+            desyncUdp = true,
             desyncMethod = 2,
             splitPosition = 1,
             splitAtHost = false,
@@ -58,7 +58,7 @@ class ByeDpiProxy {
             hostsMode = 0,
             hosts = null,
             tfo = false,
-            udpFakeCount = 0,
+            udpFakeCount = 1,
             dropSack = false,
             fakeOffset = 0
         )
@@ -124,4 +124,3 @@ class ByeDpiProxy {
     external fun jniStartProxy(fd: Int): Int
     external fun jniStopProxy(fd: Int): Int
 }
-
