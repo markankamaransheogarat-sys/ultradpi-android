@@ -1,5 +1,7 @@
 package io.github.dovecoteescapee.byedpi.core
 
+import android.util.Log
+
 class ByeDpiProxy {
     companion object {
         init {
@@ -8,6 +10,51 @@ class ByeDpiProxy {
     }
 
     private var fd: Int = -1
+
+    fun startProxy(port: Int): Int {
+        if (fd >= 0) {
+            return -1
+        }
+        // Вызов проверенного JNI-метода с чистыми настройками:
+        // desyncHttp = true, desyncHttps = true, desyncUdp = false (чистый UDP для мгновенного DNS!)
+        // desyncMethod = 2 (DESYNC_DISORDER: split pos 1, reverse order - золотой стандарт обхода YouTube в РФ)
+        val socketFd = jniCreateSocket(
+            ip = "127.0.0.1",
+            port = port,
+            maxConnections = 512,
+            bufferSize = 16384,
+            defaultTtl = 0,
+            customTtl = false,
+            noDomain = false,
+            desyncHttp = true,
+            desyncHttps = true,
+            desyncUdp = false,
+            desyncMethod = 2,
+            splitPosition = 1,
+            splitAtHost = false,
+            fakeTtl = 8,
+            fakeSni = "www.iana.org",
+            customOobChar = 'a'.code.toByte(),
+            hostMixedCase = false,
+            domainMixedCase = false,
+            hostRemoveSpaces = false,
+            tlsRecordSplit = false,
+            tlsRecordSplitPosition = 0,
+            tlsRecordSplitAtSni = false,
+            hostsMode = 0,
+            hosts = null,
+            tfo = false,
+            udpFakeCount = 0,
+            dropSack = false,
+            fakeOffset = 0
+        )
+        if (socketFd < 0) {
+            Log.e("ByeDpiProxy", "jniCreateSocket failed with code $socketFd")
+            return -1
+        }
+        this.fd = socketFd
+        return jniStartProxy(socketFd)
+    }
 
     fun startProxyWithArgs(args: Array<String>): Int {
         val socketFd = jniCreateSocketWithCommandLine(args)
@@ -28,7 +75,39 @@ class ByeDpiProxy {
         return 0
     }
 
+    external fun jniCreateSocket(
+        ip: String,
+        port: Int,
+        maxConnections: Int,
+        bufferSize: Int,
+        defaultTtl: Int,
+        customTtl: Boolean,
+        noDomain: Boolean,
+        desyncHttp: Boolean,
+        desyncHttps: Boolean,
+        desyncUdp: Boolean,
+        desyncMethod: Int,
+        splitPosition: Int,
+        splitAtHost: Boolean,
+        fakeTtl: Int,
+        fakeSni: String,
+        customOobChar: Byte,
+        hostMixedCase: Boolean,
+        domainMixedCase: Boolean,
+        hostRemoveSpaces: Boolean,
+        tlsRecordSplit: Boolean,
+        tlsRecordSplitPosition: Int,
+        tlsRecordSplitAtSni: Boolean,
+        hostsMode: Int,
+        hosts: String?,
+        tfo: Boolean,
+        udpFakeCount: Int,
+        dropSack: Boolean,
+        fakeOffset: Int
+    ): Int
+
     external fun jniCreateSocketWithCommandLine(args: Array<String>): Int
     external fun jniStartProxy(fd: Int): Int
     external fun jniStopProxy(fd: Int): Int
 }
+

@@ -57,25 +57,11 @@ class UltraDpiVpnService : VpnService() {
                 startForeground(NOTIFICATION_ID, notification)
             }
 
-            // 1. Стандартный проверенный пресет ByeDPI:
-            // -s 1 (TCP split pos 1)
-            // -q 1 (DISOOB / disorder)
-            // -e 1 (split TLS ClientHello SNI)
-            // БЕЗ фейковых пакетов (-f/--fake), так как битые фейк-пакеты вызывают ERR_SSL_VERSION_OR_CIPHER_MISMATCH в Chrome/YouTube
-            val args = arrayOf(
-                "ciadpi",
-                "-i", "127.0.0.1",
-                "-p", "$SOCKS_PORT",
-                "-s", "1",
-                "-q", "1",
-                "-e", "1",
-                "-o", "1"
-            )
-
+            // 1. Запуск нативного ByeDPI Proxy через прямой JNI-вызов с чистыми параметрами (DESYNC_DISORDER split=1)
             proxyThread = Thread {
                 try {
-                    val code = byeDpiProxy.startProxyWithArgs(args)
-                    Log.i(TAG, "ByeDPI stopped with code $code")
+                    val code = byeDpiProxy.startProxy(SOCKS_PORT)
+                    Log.i(TAG, "ByeDPI proxy exited with code $code")
                 } catch (e: Throwable) {
                     Log.e(TAG, "Error in ByeDPI thread", e)
                 }
@@ -84,13 +70,16 @@ class UltraDpiVpnService : VpnService() {
                 start()
             }
 
-            Thread.sleep(200)
+            Thread.sleep(250)
 
-            // 2. Создание VPN-туннеля
+            // 2. Создание системного VPN-туннеля
+            // Включаем Yandex DNS (77.88.8.8) как основной быстрый и никогда не блокируемый в РФ DNS,
+            // а также Cloudflare (1.1.1.1) и Google (8.8.8.8) в качестве резерва.
             val builder = Builder()
                 .setSession("UltraDPI Engine")
                 .addAddress("10.10.10.10", 32)
                 .addRoute("0.0.0.0", 0)
+                .addDnsServer("77.88.8.8")
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
                 .addDisallowedApplication(applicationContext.packageName)
@@ -107,15 +96,17 @@ class UltraDpiVpnService : VpnService() {
             }
             this.vpnInterface = pfd
 
-            // 3. Конфиг hev-socks5-tunnel
+            // 3. Конфигурация tun2socks (hev-socks5-tunnel)
             val tun2socksConfig = """
+                tunnel:
+                  mtu: 8500
                 misc:
                   task-stack-size: 81920
                 socks5:
                   mtu: 8500
                   address: 127.0.0.1
                   port: $SOCKS_PORT
-                  udp: 'udp'
+                  udp: udp
             """.trimIndent()
 
             val configFile = File(cacheDir, "tunnel.yaml")
