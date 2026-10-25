@@ -11,6 +11,20 @@ class ByeDpiProxy {
 
     private var fd: Int = -1
 
+    fun startProxyWithPreset(port: Int, presetArgs: Array<String>): Int {
+        if (fd >= 0) {
+            return -1
+        }
+        val fullArgs = arrayOf("ciadpi", "-i", "127.0.0.1", "-p", "$port") + presetArgs
+        val socketFd = jniCreateSocketWithCommandLine(fullArgs)
+        if (socketFd < 0) {
+            Log.e("ByeDpiProxy", "jniCreateSocketWithCommandLine failed with code $socketFd")
+            return -1
+        }
+        this.fd = socketFd
+        return jniStartProxy(socketFd)
+    }
+
     fun startProxy(port: Int): Int {
         if (fd >= 0) {
             return -1

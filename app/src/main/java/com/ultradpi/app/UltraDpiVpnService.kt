@@ -26,22 +26,29 @@ class UltraDpiVpnService : VpnService() {
         const val TAG = "UltraDpiVpn"
         const val ACTION_START = "com.ultradpi.START"
         const val ACTION_STOP = "com.ultradpi.STOP"
-        const val CHANNEL_ID = "ultradpi_channel_v6"
-        const val NOTIFICATION_ID = 1006
+        const val EXTRA_PRESET = "com.ultradpi.PRESET_INDEX"
+        const val CHANNEL_ID = "ultradpi_channel_v7"
+        const val NOTIFICATION_ID = 1007
         const val SOCKS_PORT = 10808
     }
 
+    private var currentPreset = BypassPreset.UNIVERSAL
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startEngine()
+            ACTION_START -> {
+                val presetIndex = intent.getIntExtra(EXTRA_PRESET, 0)
+                startEngine(presetIndex)
+            }
             ACTION_STOP -> stopEngine()
         }
         return START_NOT_STICKY
     }
 
-    private fun startEngine() {
+    private fun startEngine(presetIndex: Int) {
         if (isRunning) return
         isRunning = true
+        currentPreset = BypassPreset.fromIndex(presetIndex)
 
         try {
             createNotificationChannel()
@@ -57,10 +64,12 @@ class UltraDpiVpnService : VpnService() {
                 startForeground(NOTIFICATION_ID, notification)
             }
 
-            // 1. Запуск нативного ByeDPI Proxy через прямой JNI-вызов с чистыми параметрами (DESYNC_DISORDER split=1)
+            Log.i(TAG, "Starting ByeDPI with preset: ${currentPreset.title}")
+
+            // 1. Запуск нативного ByeDPI Proxy с выбранным пресетом обхода
             proxyThread = Thread {
                 try {
-                    val code = byeDpiProxy.startProxy(SOCKS_PORT)
+                    val code = byeDpiProxy.startProxyWithPreset(SOCKS_PORT, currentPreset.args)
                     Log.i(TAG, "ByeDPI proxy exited with code $code")
                 } catch (e: Throwable) {
                     Log.e(TAG, "Error in ByeDPI thread", e)
@@ -176,7 +185,7 @@ class UltraDpiVpnService : VpnService() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("UltraDPI — Защита включена")
+            .setContentTitle("UltraDPI — ${currentPreset.title}")
             .setContentText("YouTube 4K, Discord и нейросети работают на полной скорости")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(contentPending)
