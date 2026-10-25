@@ -10,41 +10,72 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import io.github.dovecoteescapee.byedpi.core.ByeDpiProxy
+import io.github.dovecoteescapee.byedpi.core.TProxyService
 import kotlinx.coroutines.*
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.nio.ByteBuffer
+import java.io.File
 
 class UltraDpiVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
-    private var job: Job? = null
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var proxyFd: Int = -1
+    private var proxyThread: Thread? = null
+    private var tunnelThread: Thread? = null
 
     companion object {
         const val TAG = "UltraDpiVpn"
         const val ACTION_START = "com.ultradpi.START"
         const val ACTION_STOP = "com.ultradpi.STOP"
-        const val CHANNEL_ID = "ultradpi_channel_v2"
-        const val NOTIFICATION_ID = 1001
+        const val CHANNEL_ID = "ultradpi_channel_v3"
+        const val NOTIFICATION_ID = 1002
+        const val SOCKS_PORT = 10808
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startVpn()
-            ACTION_STOP -> stopVpn()
+            ACTION_START -> startEngine()
+            ACTION_STOP -> stopEngine()
         }
         return START_NOT_STICKY
     }
 
-    private fun startVpn() {
+    private fun startEngine() {
         try {
             createNotificationChannel()
             startForeground(NOTIFICATION_ID, buildNotification())
 
+            // 1. Launch native ByeDPI desync daemon on port 10808
+            // Uses winning TSPU evasion args: Split SNI + Fake packets + Hop-limit TTL=3
+            val args = arrayOf(
+                "ciadpi",
+                "-i", "127.0.0.1",
+                "-p", "$SOCKS_PORT",
+                "-s", "1",
+                "-q", "1",
+                "-e", "2",
+                "-o", "1+s",
+                "--fake", "-1",
+                "--ttl", "3"
+            )
+
+            proxyFd = ByeDpiProxy.jniCreateSocketWithCommandLine(args)
+            if (proxyFd < 0) {
+                Log.e(TAG, "Failed to create ByeDPI native socket")
+                stopSelf()
+                return
+            }
+
+            proxyThread = Thread {
+                ByeDpiProxy.jniStart(proxyFd)
+            }.apply {
+                name = "ByeDpiThread"
+                start()
+            }
+
+            // 2. Establish Android VpnService interface
             val builder = Builder()
-                .setSession("UltraDPI Protection")
-                .addAddress("10.233.1.2", 24)
+                .setSession("UltraDPI 1-Click Engine")
+                .addAddress("10.0.2.15", 24)
                 .addDnsServer("1.1.1.1")
                 .addDnsServer("8.8.8.8")
                 .addRoute("0.0.0.0", 0)
@@ -53,75 +84,51 @@ class UltraDpiVpnService : VpnService() {
 
             vpnInterface = builder.establish()
             if (vpnInterface == null) {
-                Log.e(TAG, "VPN Interface failed to establish")
-                stopSelf()
+                Log.e(TAG, "VPN builder establish returned null")
+                stopEngine()
                 return
             }
 
-            job = scope.launch {
-                processPackets()
+            // 3. Write hev-socks5-tunnel yaml config redirecting all system TUN traffic to 127.0.0.1:10808
+            val configFile = File(cacheDir, "tunnel.yaml")
+            configFile.writeText(
+                """
+                tunnel:
+                  mtu: 1500
+                socks5:
+                  port: $SOCKS_PORT
+                  address: 127.0.0.1
+                misc:
+                  log-level: warn
+                """.trimIndent()
+            )
+
+            // 4. Start native hev-socks5-tunnel routing engine
+            tunnelThread = Thread {
+                TProxyService.TProxyStartService(configFile.absolutePath, vpnInterface!!.fd)
+            }.apply {
+                name = "HevTunnelThread"
+                start()
             }
+
+            Log.i(TAG, "UltraDPI Full-Speed Local Bypass successfully started!")
         } catch (e: Throwable) {
-            Log.e(TAG, "Fatal starting VPN", e)
-            stopSelf()
+            Log.e(TAG, "Fatal starting engine", e)
+            stopEngine()
         }
     }
 
-    private fun stopVpn() {
+    private fun stopEngine() {
         try {
-            job?.cancel()
+            TProxyService.TProxyStopService()
+            ByeDpiProxy.jniStop()
             vpnInterface?.close()
             vpnInterface = null
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         } catch (e: Throwable) {
-            Log.e(TAG, "Error stopping VPN", e)
+            Log.e(TAG, "Error stopping engine", e)
         }
-    }
-
-    private suspend fun processPackets() = withContext(Dispatchers.IO) {
-        val pfd = vpnInterface ?: return@withContext
-        try {
-            FileInputStream(pfd.fileDescriptor).use { input ->
-                FileOutputStream(pfd.fileDescriptor).use { output ->
-                    val packet = ByteBuffer.allocate(32767)
-                    while (isActive) {
-                        packet.clear()
-                        val length = input.read(packet.array())
-                        if (length > 0) {
-                            packet.limit(length)
-                            val desynced = desyncPacket(packet.array(), length)
-                            output.write(desynced)
-                        } else {
-                            delay(5)
-                        }
-                    }
-                }
-            }
-        } catch (e: Throwable) {
-            if (isActive) Log.e(TAG, "Error in packet loop", e)
-        }
-    }
-
-    private fun desyncPacket(data: ByteArray, length: Int): ByteArray {
-        if (length < 40) return data.copyOf(length)
-
-        val ipHeaderLen = (data[0].toInt() and 0x0F) * 4
-        val protocol = data[9].toInt()
-
-        // TCP Packet (Protocol 6)
-        if (protocol == 6 && length > ipHeaderLen + 20) {
-            val tcpHeaderLen = ((data[ipHeaderLen + 12].toInt() ushr 4) and 0x0F) * 4
-            val payloadOffset = ipHeaderLen + tcpHeaderLen
-
-            if (length > payloadOffset + 5) {
-                val isTls = data[payloadOffset] == 0x16.toByte() && data[payloadOffset + 1] == 0x03.toByte()
-                if (isTls) {
-                    return data.copyOf(length)
-                }
-            }
-        }
-        return data.copyOf(length)
     }
 
     private fun createNotificationChannel() {
@@ -131,7 +138,7 @@ class UltraDpiVpnService : VpnService() {
                 "UltraDPI Status",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "UltraDPI background packet evasion"
+                description = "UltraDPI 1-Click bypass active"
                 setShowBadge(false)
             }
             val manager = getSystemService(NotificationManager::class.java)
@@ -156,7 +163,7 @@ class UltraDpiVpnService : VpnService() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("UltraDPI — Защита включена")
-            .setContentText("YouTube 4K, Discord Voice и нейросети работают без задержек")
+            .setContentText("YouTube 4K, Discord и нейросети работают на полной скорости")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(contentPending)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Отключить", stopPending)
@@ -166,8 +173,7 @@ class UltraDpiVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        stopVpn()
-        scope.cancel()
+        stopEngine()
         super.onDestroy()
     }
 }
